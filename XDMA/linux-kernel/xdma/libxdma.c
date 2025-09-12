@@ -366,14 +366,11 @@ void get_perf_stats(struct xdma_engine *engine)
 	engine->xdma_perf->pending_count = build_u64(hi, lo);
 }
 
-static int engine_reg_dump(struct xdma_engine *engine)
+static void engine_reg_dump(struct xdma_engine *engine)
 {
 	u32 w;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
+	BUG_ON(!engine);
 
 	w = read_register(&engine->regs->identifier);
 	pr_info("%s: ioread32(0x%p) = 0x%08x (id).\n", engine->name,
@@ -382,7 +379,7 @@ static int engine_reg_dump(struct xdma_engine *engine)
 	if (w != BLOCK_ID_HEAD) {
 		pr_err("%s: engine id missing, 0x%08x exp. & 0x%x = 0x%x\n",
 		       engine->name, w, BLOCK_ID_MASK, BLOCK_ID_HEAD);
-		return -EINVAL;
+		return;
 	}
 	/* extra debugging; inspect complete engine set of registers */
 	w = read_register(&engine->regs->status);
@@ -406,8 +403,6 @@ static int engine_reg_dump(struct xdma_engine *engine)
 	w = read_register(&engine->regs->interrupt_enable_mask);
 	pr_info("%s: ioread32(0x%p) = 0x%08x (interrupt_enable_mask)\n",
 		engine->name, &engine->regs->interrupt_enable_mask, w);
-
-	return 0;
 }
 
 static void engine_status_dump(struct xdma_engine *engine)
@@ -504,22 +499,13 @@ static void engine_status_dump(struct xdma_engine *engine)
  *
  * @return error value on failure, 0 otherwise
  */
-static int engine_status_read(struct xdma_engine *engine, bool clear, bool dump)
+static void engine_status_read(struct xdma_engine *engine, bool clear, bool dump)
 {
-	int rv = 0;
+	BUG_ON(!engine);
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-
-	if (dump) {
-		rv = engine_reg_dump(engine);
-		if (rv < 0) {
-			pr_err("Failed to dump register\n");
-			return rv;
-		}
-	}
+	// if (dump) {
+	// 	engine_reg_dump(engine);
+	// }
 
 	/* read status register */
 	if (clear)
@@ -529,8 +515,6 @@ static int engine_status_read(struct xdma_engine *engine, bool clear, bool dump)
 
 	if (dump)
 		engine_status_dump(engine);
-
-	return rv;
 }
 
 /**
@@ -764,11 +748,7 @@ static struct xdma_transfer *engine_start(struct xdma_engine *engine)
 		return NULL;
 	}
 
-	rv = engine_status_read(engine, 0, 0);
-	if (rv < 0) {
-		pr_err("Failed to read engine status\n");
-		return NULL;
-	}
+	engine_status_read(engine, 0, 0);
 	dbg_tfr("%s engine 0x%p now running\n", engine->name, engine);
 	/* remember the engine is running */
 	engine->running = 1;
@@ -783,20 +763,14 @@ static struct xdma_transfer *engine_start(struct xdma_engine *engine)
  * @engine pointer to struct xdma_engine
  *
  */
-static int engine_service_shutdown(struct xdma_engine *engine)
+static void engine_service_shutdown(struct xdma_engine *engine)
 {
-	int rv;
 	/* if the engine stopped with RUN still asserted, de-assert RUN now */
 	dbg_tfr("engine just went idle, resetting RUN_STOP.\n");
-	rv = xdma_engine_stop(engine);
-	if (rv < 0) {
-		pr_err("Failed to stop engine\n");
-		return rv;
-	}
+	xdma_engine_stop(engine);
 
 	/* awake task on engine's shutdown wait queue */
 	xlx_wake_up(&engine->shutdown_wq);
-	return 0;
 }
 
 static struct xdma_transfer *engine_transfer_completion(
@@ -829,21 +803,7 @@ engine_service_transfer_list(struct xdma_engine *engine,
 			     struct xdma_transfer *transfer,
 			     u32 *pdesc_completed)
 {
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return NULL;
-	}
-
-	if (!pdesc_completed) {
-		pr_err("%s completed descriptors are null.\n", engine->name);
-		return NULL;
-	}
-
-	if (unlikely(!transfer)) {
-		pr_info("%s xfer empty, pdesc completed %u.\n", engine->name,
-			*pdesc_completed);
-		return NULL;
-	}
+	BUG_ON(!engine || !transfer || !pdesc_completed);
 
 	/*
 	 * iterate over all the transfers completed by the engine,
@@ -913,27 +873,12 @@ static int engine_err_handle(struct xdma_engine *engine,
 	return rv;
 }
 
-static struct xdma_transfer *
+static void
 engine_service_final_transfer(struct xdma_engine *engine,
 			      struct xdma_transfer *transfer,
-			      u32 *pdesc_completed)
+			      const u32 *pdesc_completed)
 {
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return NULL;
-	}
-
-	if (!pdesc_completed) {
-		pr_err("%s completed descriptors are null.\n", engine->name);
-		return NULL;
-	}
-
-	/* inspect the current transfer */
-	if (unlikely(!transfer)) {
-		pr_info("%s xfer empty, pdesc completed %u.\n", engine->name,
-			*pdesc_completed);
-		return NULL;
-	}
+	BUG_ON(!engine || !pdesc_completed || !transfer);
 
 	if (((engine->dir == DMA_FROM_DEVICE) &&
 	     (engine->status & XDMA_STAT_C2H_ERR_MASK)) ||
@@ -968,7 +913,7 @@ engine_service_final_transfer(struct xdma_engine *engine,
 
 			transfer->desc_cmpl += *pdesc_completed;
 			if (!(transfer->flags & XFER_FLAG_ST_C2H_EOP_RCVED)) {
-				return NULL;
+				return;
 			}
 
 			/* mark transfer as successfully completed */
@@ -1016,9 +961,7 @@ transfer_del:
 	 * Complete transfer - sets transfer to NULL if an asynchronous
 	 * transfer has completed
 	 */
-	transfer = engine_transfer_completion(engine, transfer);
-
-	return transfer;
+	engine_transfer_completion(engine, transfer);
 }
 
 static int engine_service_perf(struct xdma_engine *engine, u32 desc_completed)
@@ -1055,10 +998,7 @@ static int engine_service_resume(struct xdma_engine *engine)
 {
 	struct xdma_transfer *transfer_started;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
+	BUG_ON(!engine);
 
 	/* engine stopped? */
 	if (!engine->running) {
@@ -1102,19 +1042,11 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 	u32 err_flag = desc_writeback & WB_ERR_MASK;
 	int rv = 0;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
+	BUG_ON(!engine);
 
 	/* Service the engine */
 	if (!engine->running) {
-		dbg_tfr("Engine was not running!!! Clearing status\n");
-		rv = engine_status_read(engine, 1, 0);
-		if (rv < 0) {
-			pr_err("%s failed to read status\n", engine->name);
-			return rv;
-		}
+		engine_status_read(engine, 1, 1);
 		return 0;
 	}
 
@@ -1124,11 +1056,7 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 	 * unnecessary and is skipped to reduce latency
 	 */
 	if ((desc_count == 0) || (err_flag != 0)) {
-		rv = engine_status_read(engine, 1, 0);
-		if (rv < 0) {
-			pr_err("Failed to read engine status\n");
-			return rv;
-		}
+		engine_status_read(engine, 1, 0);
 	}
 
 	/*
@@ -1183,13 +1111,17 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 	desc_count -= engine->desc_dequeued;
 
 	/* Process all but the last transfer */
+	if (transfer) {
 	transfer = engine_service_transfer_list(engine, transfer, &desc_count);
+	}
 
 	/*
 	 * Process final transfer - includes checks of number of descriptors to
 	 * detect faulty completion
 	 */
-	transfer = engine_service_final_transfer(engine, transfer, &desc_count);
+	if (transfer) {
+		engine_service_final_transfer(engine, transfer, &desc_count);
+	}
 
 	/* Restart the engine following the servicing */
 	if (!engine->eop_flush) {
@@ -1380,12 +1312,6 @@ static irqreturn_t xdma_isr(int irq, void *dev_id)
 		return -IRQ_NONE;
 	}
 	xdev = (struct xdma_dev *)dev_id;
-
-	if (!xdev) {
-		WARN_ON(!xdev);
-		dbg_irq("%s(irq=%d) xdev=%p ??\n", __func__, irq, xdev);
-		return IRQ_NONE;
-	}
 
 	irq_regs = (struct interrupt_regs *)(xdev->bar[xdev->config_bar_idx] +
 					     XDMA_OFS_INT_CTRL);
@@ -2405,15 +2331,7 @@ static int transfer_abort(struct xdma_engine *engine,
 {
 	struct xdma_transfer *head;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-
-	if (!transfer) {
-		pr_err("Invalid DMA transfer\n");
-		return -EINVAL;
-	}
+	BUG_ON(!engine || !transfer);
 
 	if (transfer->desc_num == 0) {
 		pr_err("%s void descriptors in the transfer list\n",
@@ -2421,7 +2339,7 @@ static int transfer_abort(struct xdma_engine *engine,
 		return -EINVAL;
 	}
 
-	pr_info("abort transfer 0x%p, desc %d, engine desc queued %d.\n",
+	pr_info("abort transfer 0x%p, desc %d, engine desc dequeued %d.\n",
 		transfer, transfer->desc_num, engine->desc_dequeued);
 
 	head = list_entry(engine->transfer_list.next, struct xdma_transfer,
@@ -3408,11 +3326,7 @@ ssize_t xdma_xfer_aperture(struct xdma_engine *engine, bool write, u64 ep_addr,
 			/* transfer can still be in-flight */
 			pr_info("xfer 0x%p,%u, s 0x%x timed out, ep 0x%llx.\n",
 				xfer, xfer->len, xfer->state, req->ep_addr);
-			rv = engine_status_read(engine, 0, 1);
-			if (rv < 0) {
-				pr_err("Failed to read engine status\n");
-			} else if (rv == 0) {
-				//engine_status_dump(engine);
+			engine_status_read(engine, 0, 1);
 				rv = transfer_abort(engine, xfer);
 				if (rv < 0) {
 					pr_err("Failed to stop engine\n");
@@ -3420,7 +3334,6 @@ ssize_t xdma_xfer_aperture(struct xdma_engine *engine, bool write, u64 ep_addr,
 					rv = xdma_engine_stop(engine);
 					if (rv < 0)
 						pr_err("Failed to stop engine\n");
-				}
 			}
 			spin_unlock_irqrestore(&engine->lock, flags);
 
@@ -3638,11 +3551,7 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			/* transfer can still be in-flight */
 			pr_info("xfer 0x%p,%u, s 0x%x timed out, ep 0x%llx.\n",
 				xfer, xfer->len, xfer->state, req->ep_addr);
-			rv = engine_status_read(engine, 0, 1);
-			if (rv < 0) {
-				pr_err("Failed to read engine status\n");
-			} else if (rv == 0) {
-				//engine_status_dump(engine);
+			engine_status_read(engine, 0, 1);
 				rv = transfer_abort(engine, xfer);
 				if (rv < 0) {
 					pr_err("Failed to stop engine\n");
@@ -3650,7 +3559,6 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 					rv = xdma_engine_stop(engine);
 					if (rv < 0)
 						pr_err("Failed to stop engine\n");
-				}
 			}
 			spin_unlock_irqrestore(&engine->lock, flags);
 
@@ -3780,7 +3688,6 @@ ssize_t xdma_xfer_completion(void *cb_hndl, void *dev_hndl, int channel,
 			pr_info("xfer 0x%p,%u, s 0x%x timed out, ep 0x%llx.\n",
 				xfer, xfer->len, xfer->state, req->ep_addr);
 			engine_status_read(engine, 0, 1);
-			engine_status_dump(engine);
 			transfer_abort(engine, xfer);
 
 			xdma_engine_stop(engine);
@@ -4360,8 +4267,7 @@ static int probe_for_engine(struct xdma_dev *xdev, enum dma_data_direction dir,
 		dbg_init(
 			"%s %d engine, reg off 0x%x, id mismatch 0x%x,0x%x,exp 0x%x,0x%x, SKIP.\n",
 			dir == DMA_TO_DEVICE ? "H2C" : "C2H", channel, offset,
-			engine_id, channel_id, engine_id_expected,
-			channel_id != channel);
+			engine_id, channel_id, engine_id_expected, channel);
 		return -EINVAL;
 	}
 
