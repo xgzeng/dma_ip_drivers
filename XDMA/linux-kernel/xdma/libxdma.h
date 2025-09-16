@@ -510,12 +510,12 @@ struct xdma_engine {
 	u8 channel:2;		/* engine indices */
 	u8 streaming:1;
 	u8 device_open:1;	/* flag if engine node open, ST mode only */
-	u8 running:1;		/* flag if the driver started engine */
+	u8 running:2;		/* flag if the driver started engine */
 	u8 non_incr_addr:1;	/* flag if non-incremental addressing used */
 	u8 eop_flush:1;		/* st c2h only, flush up the data with eop */
-	u8 filler:1;
+	// u8 stopping:1;
 
-	int max_extra_adj;	/* descriptor prefetch capability */
+	// int max_extra_adj;	/* descriptor prefetch capability */
 	int desc_dequeued;	/* num descriptors of completed transfers */
 	u32 desc_max;		/* max # descriptors per xfer */
 	u32 status;		/* last known status of device */
@@ -524,6 +524,7 @@ struct xdma_engine {
 
 	/* Transfer list management */
 	struct list_head transfer_list;	/* queue of transfers */
+	struct list_head transfer_pending_list;
 
 	/* Members applicable to AXI-ST C2H (cyclic) transfers */
 	struct xdma_result *cyclic_result;
@@ -536,13 +537,13 @@ struct xdma_engine {
 	dma_addr_t poll_mode_bus;	/* bus addr for descriptor writeback */
 
 	/* Members associated with interrupt mode support */
-#if	HAS_SWAKE_UP
-	struct swait_queue_head shutdown_wq;
-#else
-	wait_queue_head_t shutdown_wq;	/* wait queue for shutdown sync */
-#endif
+// #if	HAS_SWAKE_UP
+// 	struct swait_queue_head shutdown_wq;
+// #else
+// 	wait_queue_head_t shutdown_wq;	/* wait queue for shutdown sync */
+// #endif
 	spinlock_t lock;		/* protects concurrent access */
-	int prev_cpu;			/* remember CPU# of (last) locker */
+	// int prev_cpu;			/* remember CPU# of (last) locker */
 	int msix_irq_line;		/* MSI-X vector for this engine */
 	u32 irq_bitmask;		/* IRQ bit mask for this engine */
 	struct work_struct work;	/* Work queue for interrupt handling */
@@ -641,22 +642,6 @@ static inline int xdma_device_flag_check(struct xdma_dev *xdev, unsigned int f)
 	}
 	spin_unlock_irqrestore(&xdev->lock, flags);
 	return 0;
-}
-
-static inline int xdma_device_flag_test_n_set(struct xdma_dev *xdev,
-					 unsigned int f)
-{
-	unsigned long flags;
-	int rv = 0;
-
-	spin_lock_irqsave(&xdev->lock, flags);
-	if (xdev->flags & f) {
-		spin_unlock_irqrestore(&xdev->lock, flags);
-		rv = 1;
-	} else
-		xdev->flags |= f;
-	spin_unlock_irqrestore(&xdev->lock, flags);
-	return rv;
 }
 
 static inline void xdma_device_flag_set(struct xdma_dev *xdev, unsigned int f)

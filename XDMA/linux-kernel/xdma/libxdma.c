@@ -52,7 +52,27 @@ module_param(desc_blen_max, uint, 0644);
 MODULE_PARM_DESC(desc_blen_max,
 		 "per descriptor max. buffer length, default is (1 << 28) - 1");
 
+static unsigned int h2c_trace = 0;
+module_param(h2c_trace, uint, 0644);
+MODULE_PARM_DESC(h2c_trace, "Set 1 to enable H2C trace log");
+
+static unsigned int c2h_trace = 0;
+module_param(c2h_trace, uint, 0644);
+MODULE_PARM_DESC(c2h_trace, "Set 1 to enable C2H trace log");
+
+#define trace_enabled(e) \
+	((h2c_trace && e->dir == DMA_TO_DEVICE) \
+	|| (c2h_trace && e->dir == DMA_FROM_DEVICE)) 
+
+#define xdma_trace(e, fmt, ...) \
+	if (trace_enabled(e)) pr_info("%s " fmt, e->name, ##__VA_ARGS__)
+
 #define XDMA_PERF_NUM_DESC 128
+
+// engine->running values
+#define STOPPED 0
+#define RUNNING 1
+#define STOPPING 2
 
 /* Kernel version adaptative code */
 #if HAS_SWAKE_UP_ONE
@@ -65,6 +85,7 @@ MODULE_PARM_DESC(desc_blen_max,
 			swait_event_interruptible_timeout_exclusive
 #define xlx_wait_event_interruptible \
 			swait_event_interruptible_exclusive
+#define xlx_wait_event_timeout swait_event_timeout_exclusive
 #elif HAS_SWAKE_UP
 #define xlx_wake_up	swake_up
 #define xlx_wait_event_interruptible_timeout \
@@ -416,6 +437,8 @@ static void engine_status_dump(struct xdma_engine *engine)
 
 	if ((v & XDMA_STAT_BUSY))
 		len += sprintf(buf + len, "BUSY,");
+	if ((v & XDMA_STAT_IDLE_STOPPED))
+		len += sprintf(buf + len, "IDLE_STOPPED,");
 	if ((v & XDMA_STAT_DESC_STOPPED))
 		len += sprintf(buf + len, "DESC_STOPPED,");
 	if ((v & XDMA_STAT_DESC_COMPLETED))
@@ -524,12 +547,10 @@ static void engine_status_read(struct xdma_engine *engine, bool clear, bool dump
 static int xdma_engine_stop(struct xdma_engine *engine)
 {
 	u32 w;
+    BUG_ON(!engine);
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-	dbg_tfr("%s(engine=%p)\n", __func__, engine);
+	if (engine->running != RUNNING)
+		pr_warn("%s is not RUNNING", engine->name);
 
 	if (enable_st_c2h_credit && engine->streaming &&
 	    engine->dir == DMA_FROM_DEVICE)
@@ -546,6 +567,7 @@ static int xdma_engine_stop(struct xdma_engine *engine)
 	} else {
 		w |= (u32)XDMA_CTRL_IE_DESC_STOPPED;
 		w |= (u32)XDMA_CTRL_IE_DESC_COMPLETED;
+		w |= (u32)XDMA_CTRL_IE_IDLE_STOPPED;
 	}
 
 	dbg_tfr("Stopping SG DMA %s engine; writing 0x%08x to 0x%p.\n",
@@ -555,18 +577,16 @@ static int xdma_engine_stop(struct xdma_engine *engine)
 				(unsigned long)(&engine->regs));
 	/* dummy read of status register to flush all previous writes */
 	dbg_tfr("%s(%s) done\n", __func__, engine->name);
-	engine->running = 0;
+	xdma_trace(engine, "=>STOPPING\n");
+	engine->running = STOPPING;
 	return 0;
 }
 
-static int engine_start_mode_config(struct xdma_engine *engine)
+static void engine_start_mode_config(struct xdma_engine *engine)
 {
 	u32 w;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
+	BUG_ON(!engine);
 
 	/* If a perf test is running, enable the engine interrupts */
 	if (engine->xdma_perf) {
@@ -596,6 +616,7 @@ static int engine_start_mode_config(struct xdma_engine *engine)
 	} else {
 		w |= (u32)XDMA_CTRL_IE_DESC_STOPPED;
 		w |= (u32)XDMA_CTRL_IE_DESC_COMPLETED;
+		w |= (u32)XDMA_CTRL_IE_IDLE_STOPPED;
 	}
 
 	/* set non-incremental addressing mode */
@@ -604,6 +625,10 @@ static int engine_start_mode_config(struct xdma_engine *engine)
 
 	dbg_tfr("iowrite32(0x%08x to 0x%p) (control)\n", w,
 		(void *)&engine->regs->control);
+
+	// if (read_register(&engine->regs->control) & XDMA_CTRL_RUN_STOP) {
+	// 	pr_err("%s, engine is running\n", engine->name);
+	// }
 
 	/* start the engine */
 	write_register(w, &engine->regs->control,
@@ -614,7 +639,6 @@ static int engine_start_mode_config(struct xdma_engine *engine)
 	w = read_register(&engine->regs->status);
 	dbg_tfr("ioread32(0x%p) = 0x%08x (dummy read flushes writes).\n",
 		&engine->regs->status, w);
-	return 0;
 }
 
 /**
@@ -647,7 +671,7 @@ static u32 xdma_get_next_adj(unsigned int remaining, u32 next_lo)
 }
 
 /**
- * engine_start() - start an idle engine with its first transfer on queue
+ * xdma_engine_start() - start an idle engine with its first transfer on queue
  *
  * The engine will run and process all transfers that are queued using
  * transfer_queue() and thus have their descriptor lists chained.
@@ -662,22 +686,16 @@ static u32 xdma_get_next_adj(unsigned int remaining, u32 next_lo)
  * taken.
  *
  */
-static struct xdma_transfer *engine_start(struct xdma_engine *engine)
+static struct xdma_transfer *xdma_engine_start(struct xdma_engine *engine)
 {
 	struct xdma_transfer *transfer;
 	u32 w, next_adj;
-	int rv;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return NULL;
-	}
+	BUG_ON(!engine);
 
-	/* engine must be idle */
 	if (engine->running) {
-		pr_info("%s engine is not in idle state to start\n",
-			engine->name);
-		return NULL;
+		pr_err("%s: start engine in running state %d",
+			engine->name, engine->running);
 	}
 
 	/* engine transfer queue must not be empty */
@@ -687,13 +705,16 @@ static struct xdma_transfer *engine_start(struct xdma_engine *engine)
 		return NULL;
 	}
 	/* inspect first transfer queued on the engine */
-	transfer = list_entry(engine->transfer_list.next, struct xdma_transfer,
+	transfer = list_first_entry(&engine->transfer_list, struct xdma_transfer,
 			      entry);
 	if (!transfer) {
 		pr_debug("%s queued transfer must not be empty\n",
 			 engine->name);
 		return NULL;
 	}
+	transfer->state = TRANSFER_STATE_SUBMITTED;
+
+	xdma_trace(engine, "transfer 0x%p submitted\n", transfer);
 
 	/* engine is no longer shutdown */
 	engine->shutdown = ENGINE_SHUTDOWN_NONE;
@@ -742,16 +763,11 @@ static struct xdma_transfer *engine_start(struct xdma_engine *engine)
 	mmiowb();
 #endif
 
-	rv = engine_start_mode_config(engine);
-	if (rv < 0) {
-		pr_err("Failed to start engine mode config\n");
-		return NULL;
-	}
-
-	engine_status_read(engine, 0, 0);
+	engine_start_mode_config(engine);
 	dbg_tfr("%s engine 0x%p now running\n", engine->name, engine);
 	/* remember the engine is running */
-	engine->running = 1;
+	xdma_trace(engine, "=>RUNNING\n");
+	engine->running = RUNNING;
 	return transfer;
 }
 
@@ -770,22 +786,14 @@ static void engine_service_shutdown(struct xdma_engine *engine)
 	xdma_engine_stop(engine);
 
 	/* awake task on engine's shutdown wait queue */
-	xlx_wake_up(&engine->shutdown_wq);
+	// xlx_wake_up(&engine->shutdown_wq);
 }
 
-static struct xdma_transfer *engine_transfer_completion(
+static void engine_transfer_completion(
 		struct xdma_engine *engine,
 		struct xdma_transfer *transfer)
 {
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return NULL;
-	}
-
-	if (unlikely(!transfer)) {
-		pr_info("%s: xfer empty.\n", engine->name);
-		return NULL;
-	}
+	BUG_ON(!engine || !transfer);
 
 	/* synchronous I/O? */
 	/* awake task on transfer's wait queue */
@@ -794,8 +802,6 @@ static struct xdma_transfer *engine_transfer_completion(
 	/* Send completion notification for Last transfer */
 	if (transfer->cb && transfer->last_in_request)
 		transfer->cb->io_done((unsigned long)transfer->cb, 0);
-
-	return transfer;
 }
 
 static struct xdma_transfer *
@@ -827,7 +833,7 @@ engine_service_transfer_list(struct xdma_engine *engine,
 		 * Complete transfer - sets transfer to NULL if an async
 		 * transfer has completed
 		 */
-		transfer = engine_transfer_completion(engine, transfer);
+		engine_transfer_completion(engine, transfer);
 
 		/* if exists, get the next transfer on the list */
 		if (!list_empty(&engine->transfer_list)) {
@@ -964,12 +970,9 @@ transfer_del:
 	engine_transfer_completion(engine, transfer);
 }
 
-static int engine_service_perf(struct xdma_engine *engine, u32 desc_completed)
+static void engine_service_perf(struct xdma_engine *engine, u32 desc_completed)
 {
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
+	BUG_ON(!engine);
 
 	/* performance measurement is running? */
 	if (engine->xdma_perf) {
@@ -991,10 +994,9 @@ static int engine_service_perf(struct xdma_engine *engine, u32 desc_completed)
 			dbg_perf("transfer->xdma_perf stopped\n");
 		}
 	}
-	return 0;
 }
 
-static int engine_service_resume(struct xdma_engine *engine)
+static void engine_service_resume(struct xdma_engine *engine)
 {
 	struct xdma_transfer *transfer_started;
 
@@ -1005,26 +1007,218 @@ static int engine_service_resume(struct xdma_engine *engine)
 		/* in the case of shutdown, let it finish what's in the Q */
 		if (!list_empty(&engine->transfer_list)) {
 			/* (re)start engine */
-			transfer_started = engine_start(engine);
-			if (!transfer_started) {
-				pr_err("Failed to start dma engine\n");
-				return -EINVAL;
-			}
+			transfer_started = xdma_engine_start(engine);
+			BUG_ON(!transfer_started);
 			dbg_tfr("re-started %s engine with pending xfer 0x%p\n",
 				engine->name, transfer_started);
 			/* engine was requested to be shutdown? */
 		} else if (engine->shutdown & ENGINE_SHUTDOWN_REQUEST) {
 			engine->shutdown |= ENGINE_SHUTDOWN_IDLE;
 			/* awake task on engine's shutdown wait queue */
-			xlx_wake_up(&engine->shutdown_wq);
+			// xlx_wake_up(&engine->shutdown_wq);
 		} else {
 			dbg_tfr("no pending transfers, %s engine stays idle.\n",
 				engine->name);
 		}
 	} else if (list_empty(&engine->transfer_list)) {
-		engine_service_shutdown(engine);
+		xdma_engine_stop(engine);
 	}
-	return 0;
+}
+
+static bool engine_status_has_error(struct xdma_engine *engine) {
+  if (engine->status & (XDMA_STAT_COMMON_ERR_MASK | XDMA_STAT_DESC_ERR_MASK)) {
+	return true;
+  }
+
+  if (engine->dir == DMA_TO_DEVICE) {
+	return engine->status & (XDMA_STAT_H2C_R_ERR_MASK | XDMA_STAT_H2C_W_ERR_MASK);
+  } else {
+	return engine->status & XDMA_STAT_C2H_R_ERR_MASK;
+  }
+}
+
+static void engine_complete_transfer(struct xdma_transfer* xfer, enum transfer_state state) {
+	xfer->state = state;
+	list_del(&xfer->entry);
+
+	xlx_wake_up(&xfer->wq);
+	// /* Send completion notification for Last transfer */
+	// if (xfer->cb && xfer->last_in_request)
+	// 	transfexferr->cb->io_done((unsigned long)xfer->cb, 0);
+}
+
+// complete transfers with `desc_count` new descriptor completed
+static void engine_service_handle_desc_completion(struct xdma_engine *engine, u32 desc_count) {
+	struct xdma_transfer *transfer = NULL;
+	u32 desc_pending = 0;
+
+	if (list_empty(&engine->transfer_list)) {
+		pr_warn("%s: %u descriptor completed, but there are no transfer", engine->name, desc_count);
+		engine_status_dump(engine);
+		return;
+	}
+
+	/* pick first transfer on queue (was submitted to the engine) */
+	transfer = list_first_entry(&engine->transfer_list,
+					struct xdma_transfer, entry);
+
+	// we assume only 1 transfer in list now
+	engine->desc_dequeued += desc_count;
+
+	desc_pending = transfer->desc_num - transfer->desc_cmpl;
+	if (desc_count > desc_pending) {
+		pr_warn("%s: too much descriptor completed\n", engine->name);
+		desc_count = desc_pending;
+	}
+
+	if (desc_count < desc_pending) {
+		// transfer partial complete
+		if (engine->eop_flush) {
+			struct xdma_result *result = transfer->res_virt;
+			/* check if eop in new completed descriptor */
+			for (int i = 0; i < desc_count; i++) {
+				if ((result[transfer->desc_cmpl + i].status & RX_STATUS_EOP) != 0) {
+					transfer->flags |=
+						XFER_FLAG_ST_C2H_EOP_RCVED;
+					break;
+				}
+			}
+			transfer->desc_cmpl += desc_count;
+			if (!(transfer->flags & XFER_FLAG_ST_C2H_EOP_RCVED)) {
+				return;
+			}
+			// early stop because EOP already received
+			if (engine->running == RUNNING) {
+				xdma_engine_stop(engine);
+				return;
+			}
+
+			// if (engine->status & XDMA_STAT_BUSY) {
+			// 	// EOF received, request to stop engine ASAP.
+			// 	xdma_engine_stop(engine);
+			// 	return;
+			// }
+			// // engine already stopped, we can safely complete transfer
+			// if (!(result[transfer->desc_cmpl - 1].status & RX_STATUS_EOP)) {
+			// 	pr_err("EOP not found in last completed descriptor of transfer 0x%p\n",
+			// 			transfer);
+			// }
+			// engine_complete_transfer(transfer, TRANSFER_STATE_COMPLETED);
+		} else {
+			transfer->desc_cmpl += desc_count;
+		}
+	} else {
+		/* mark transfer as successfully completed */
+		transfer->desc_cmpl = transfer->desc_num;
+		engine_complete_transfer(transfer, TRANSFER_STATE_COMPLETED);
+	}
+}
+
+static void engine_handle_stopped(struct xdma_engine *engine) {
+	// processing remaining transfers
+	// if (engine->eop_flush) {
+	// 	struct xdma_transfer* xfer = list_first_entry_or_null(
+	// 		&engine->transfer_list, struct xdma_transfer, entry);
+	// 	if (!xfer) return;
+
+	// 	// partial completion is ok for EOF Flush
+	// }
+	int n_aborted = 0;
+
+	struct xdma_transfer* xfer, *next;
+	list_for_each_entry_safe(xfer, next, &engine->transfer_list, entry) {
+		if (engine->eop_flush && xfer->desc_cmpl > 0) {
+			// for eop_flush case, partial completion is ok
+			struct xdma_result *result = xfer->res_virt;
+			if (!(result[xfer->desc_cmpl - 1].status & RX_STATUS_EOP)) {
+				pr_err("last descriptor of transfer 0x%p is not EOP\n",
+						xfer);
+			}
+			engine_complete_transfer(xfer, TRANSFER_STATE_COMPLETED);
+		} else {
+			engine_complete_transfer(xfer, TRANSFER_STATE_FAILED);
+			n_aborted += 1;
+		}
+	};
+
+	if (n_aborted) {
+		xdma_trace(engine, "%d transfer aborted\n", n_aborted);
+	}
+}
+
+/**
+ * engine_service_isr() - service an SG DMA engine in interrupt mode
+ *
+ * must be called with engine->lock already acquired
+ *
+ * @engine pointer to struct xdma_engine
+ *
+ */
+static void engine_service_isr(struct xdma_engine *engine)
+{
+	u32 desc_count = 0;
+
+	BUG_ON(!engine);
+
+	engine_status_read(engine, 1, 0);
+	/// read completed descriptor count since engine started
+	desc_count = read_register(&engine->regs->completed_desc_count);
+
+	xdma_trace(engine, "interrupt entry, running=%d desc_count=%u\n",
+		engine->running, desc_count);
+	if (trace_enabled(engine)) {
+		engine_status_dump(engine);
+	}
+
+	// check error status
+	if (engine_status_has_error(engine)) {
+		pr_err("%s interrupt by error, running=%d\n",
+			engine->name, engine->running);
+		engine_status_dump(engine);
+		if (engine->running == RUNNING) {
+			xdma_engine_stop(engine);
+			engine->running = STOPPED;
+		}
+	}
+
+	if (!engine->running && engine->status != XDMA_STAT_IDLE_STOPPED) {
+		pr_warn("%s interrupt at STOPPED state!\n", engine->name);
+		engine_status_dump(engine);
+	}
+
+	/* account for already dequeued transfers during this engine run */
+	if (desc_count > engine->desc_dequeued) {
+		// if (!(engine->status & (XDMA_STAT_DESC_STOPPED | XDMA_STAT_DESC_COMPLETED | XDMA_STAT_IDLE_STOPPED))) {
+		// 	pr_err("%s: new completion without "
+		// 		"DESC_STOPPED | DESC_COMPLETED | XDMA_STAT_IDLE_STOPPED\n",
+		// 		engine->name);
+		// 	pr_info("desc_count=%u dequeued=%d\n", desc_count, engine->desc_dequeued);
+		// 	engine_status_dump(engine);
+		// }
+
+		engine_service_handle_desc_completion(engine, desc_count - engine->desc_dequeued);
+	}
+
+	// no more transfer in-flight, request to stop engine
+	if (list_empty(&engine->transfer_list) && engine->running == RUNNING) {
+		xdma_engine_stop(engine);
+	}
+
+	if (!(engine->status & XDMA_STAT_BUSY)) {
+		// engine is really stopped, it's safe to deque transfers
+		if (engine->running == RUNNING) {
+			xdma_engine_stop(engine);
+		}
+		xdma_trace(engine, "=>STOPPED\n");
+		engine->running = STOPPED;
+		engine_handle_stopped(engine);
+		// restart engine if transfer pending
+		list_splice_init(&engine->transfer_pending_list, &engine->transfer_list);
+		if (!list_empty(&engine->transfer_list)) {
+			// restart engine
+			xdma_engine_start(engine);
+		}
+	}
 }
 
 /**
@@ -1046,6 +1240,8 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 
 	/* Service the engine */
 	if (!engine->running) {
+		pr_warn("Engine %s was not running!!! Clearing status\n",
+			engine->name);
 		engine_status_read(engine, 1, 1);
 		return 0;
 	}
@@ -1065,11 +1261,7 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 	 */
 	if ((engine->running && !(engine->status & XDMA_STAT_BUSY)) ||
 	    (!engine->eop_flush && desc_count != 0)) {
-		rv = engine_service_shutdown(engine);
-		if (rv < 0) {
-			pr_err("Failed to shutdown engine\n");
-			return rv;
-		}
+		xdma_engine_stop(engine);
 	}
 
 	/*
@@ -1100,11 +1292,7 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 			(int)desc_count,
 			(int)desc_count - engine->desc_dequeued);
 
-		rv = engine_service_perf(engine, desc_count);
-		if (rv < 0) {
-			pr_err("Failed to service descriptors\n");
-			return rv;
-		}
+		engine_service_perf(engine, desc_count);
 	}
 
 	/* account for already dequeued transfers during this engine run */
@@ -1125,9 +1313,7 @@ static int engine_service(struct xdma_engine *engine, int desc_writeback)
 
 	/* Restart the engine following the servicing */
 	if (!engine->eop_flush) {
-		rv = engine_service_resume(engine);
-		if (rv < 0)
-			pr_err("Failed to resume engine\n");
+		engine_service_resume(engine);
 	}
 
 done:
@@ -1152,12 +1338,8 @@ static void engine_service_work(struct work_struct *work)
 	/* lock the engine */
 	spin_lock_irqsave(&engine->lock, flags);
 
-	dbg_tfr("engine_service() for %s engine %p\n", engine->name, engine);
-	rv = engine_service(engine, 0);
-	if (rv < 0) {
-		pr_err("Failed to service engine\n");
-		goto unlock;
-	}
+	dbg_tfr("engine_service_isr() for %s engine %p\n", engine->name, engine);
+	engine_service_isr(engine);
 
 	/* re-enable interrupts for this engine */
 	if (engine->xdev->msix_enabled) {
@@ -2326,33 +2508,28 @@ static void xdma_desc_set(struct xdma_desc *desc, dma_addr_t rc_bus_addr,
 /*
  * should hold the engine->lock;
  */
-static int transfer_abort(struct xdma_engine *engine,
+static void transfer_abort(struct xdma_engine *engine,
 			  struct xdma_transfer *transfer)
 {
 	struct xdma_transfer *head;
 
-	BUG_ON(!engine || !transfer);
-
-	if (transfer->desc_num == 0) {
-		pr_err("%s void descriptors in the transfer list\n",
-		       engine->name);
-		return -EINVAL;
-	}
+	BUG_ON(!engine || !transfer || transfer->desc_num == 0);
 
 	pr_info("abort transfer 0x%p, desc %d, engine desc dequeued %d.\n",
 		transfer, transfer->desc_num, engine->desc_dequeued);
 
-	head = list_entry(engine->transfer_list.next, struct xdma_transfer,
-			  entry);
-	if (head == transfer)
-		list_del(engine->transfer_list.next);
-	else
-		pr_info("engine %s, transfer 0x%p NOT found, 0x%p.\n",
-			engine->name, transfer, head);
+	// remove from transfer_list or tranfer_pending_list
+	list_del(&transfer->entry);
+	// head = list_entry(engine->transfer_list.next, struct xdma_transfer,
+	// 		  entry);
+	// if (head == transfer)
+	// 	list_del(engine->transfer_list.next);
+	// else
+	// 	pr_info("engine %s, transfer 0x%p NOT found, 0x%p.\n",
+	// 		engine->name, transfer, head);
 
 	if (transfer->state == TRANSFER_STATE_SUBMITTED)
 		transfer->state = TRANSFER_STATE_ABORTED;
-	return 0;
 }
 
 /* transfer_queue() - Queue a DMA transfer on the engine
@@ -2370,20 +2547,8 @@ static int transfer_queue(struct xdma_engine *engine,
 	struct xdma_dev *xdev;
 	unsigned long flags;
 
-	if (!engine) {
-		pr_err("dma engine NULL\n");
-		return -EINVAL;
-	}
-
-	if (!engine->xdev) {
-		pr_err("Invalid xdev\n");
-		return -EINVAL;
-	}
-
-	if (!transfer) {
-		pr_err("%s Invalid DMA transfer\n", engine->name);
-		return -EINVAL;
-	}
+	BUG_ON(!engine || !transfer);
+	BUG_ON(!engine->xdev);
 
 	if (transfer->desc_num == 0) {
 		pr_err("%s void descriptors in the transfer list\n",
@@ -2391,6 +2556,10 @@ static int transfer_queue(struct xdma_engine *engine,
 		return -EINVAL;
 	}
 	dbg_tfr("%s (transfer=0x%p).\n", __func__, transfer);
+
+	if (transfer->state != TRANSFER_STATE_NEW) {
+		pr_err("try to queue transfer not STATE_NEW");
+	}
 
 	xdev = engine->xdev;
 	if (xdma_device_flag_check(xdev, XDEV_FLAG_OFFLINE)) {
@@ -2402,8 +2571,8 @@ static int transfer_queue(struct xdma_engine *engine,
 	/* lock the engine state */
 	spin_lock_irqsave(&engine->lock, flags);
 
-	engine->prev_cpu = get_cpu();
-	put_cpu();
+	// engine->prev_cpu = get_cpu();
+	// put_cpu();
 
 	/* engine is being shutdown; do not accept new transfers */
 	if (engine->shutdown & ENGINE_SHUTDOWN_REQUEST) {
@@ -2413,25 +2582,20 @@ static int transfer_queue(struct xdma_engine *engine,
 		goto shutdown;
 	}
 
-	/* mark the transfer as submitted */
-	transfer->state = TRANSFER_STATE_SUBMITTED;
-	/* add transfer to the tail of the engine transfer queue */
-	list_add_tail(&transfer->entry, &engine->transfer_list);
-
 	/* engine is idle? */
 	if (!engine->running) {
+		/* add transfer to the tail of the engine transfer queue */
+		list_add_tail(&transfer->entry, &engine->transfer_list);
 		/* start engine */
 		dbg_tfr("%s(): starting %s engine.\n", __func__, engine->name);
-		transfer_started = engine_start(engine);
-		if (!transfer_started) {
-			pr_err("Failed to start dma engine\n");
-			goto shutdown;
-		}
+		transfer_started = xdma_engine_start(engine);
+		BUG_ON (!transfer_started); // engine_start never fail
 		dbg_tfr("transfer=0x%p started %s engine with transfer 0x%p.\n",
 			transfer, engine->name, transfer_started);
 	} else {
-		dbg_tfr("transfer=0x%p queued, with %s engine running.\n",
-			transfer, engine->name);
+		// pr_info("%s: xfer %p pended\n", engine->name, transfer);
+		/* add transfer pending list */
+		list_add_tail(&transfer->entry, &engine->transfer_pending_list);
 	}
 
 shutdown:
@@ -2676,6 +2840,7 @@ static int engine_init_regs(struct xdma_engine *engine)
 		/* enable the relevant completion interrupts */
 		reg_value |= XDMA_CTRL_IE_DESC_STOPPED;
 		reg_value |= XDMA_CTRL_IE_DESC_COMPLETED;
+		reg_value |= XDMA_CTRL_IE_IDLE_STOPPED;
 	}
 
 	/* Apply engine configurations */
@@ -2898,6 +3063,11 @@ static int transfer_init(struct xdma_engine *engine,
 #else
 	init_waitqueue_head(&xfer->wq);
 #endif
+
+	if ((engine->desc_idx + desc_max) >= engine->desc_max
+		&& desc_max < engine->desc_idx) {
+		engine->desc_idx = 0;
+	}
 
 	/* remember direction of transfer */
 	xfer->dir = engine->dir;
@@ -3324,17 +3494,13 @@ ssize_t xdma_xfer_aperture(struct xdma_engine *engine, bool write, u64 ep_addr,
 			break;
 		default:
 			/* transfer can still be in-flight */
-			pr_info("xfer 0x%p,%u, s 0x%x timed out, ep 0x%llx.\n",
-				xfer, xfer->len, xfer->state, req->ep_addr);
+			pr_warn("%s xfer 0x%p,%u, s 0x%x timed out, ep 0x%llx.\n",
+				engine->name, xfer, xfer->len, xfer->state, req->ep_addr);
 			engine_status_read(engine, 0, 1);
-				rv = transfer_abort(engine, xfer);
-				if (rv < 0) {
-					pr_err("Failed to stop engine\n");
-				} else if (rv == 0) {
+			transfer_abort(engine, xfer);
 					rv = xdma_engine_stop(engine);
 					if (rv < 0)
 						pr_err("Failed to stop engine\n");
-			}
 			spin_unlock_irqrestore(&engine->lock, flags);
 
 #ifdef __LIBXDMA_DEBUG__
@@ -3383,6 +3549,7 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 	int nents;
 	enum dma_data_direction dir = write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
 	struct xdma_request_cb *req = NULL;
+	long wait_ret = 0;
 
 	if (!dev_hndl)
 		return -EINVAL;
@@ -3483,6 +3650,8 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 		if (!nents) {
 			xfer->last_in_request = 1;
 			xfer->sgt = sgt;
+		} else {
+			pr_warn("%s: multiple transfer per request\n", engine->name);
 		}
 
 		dbg_tfr("xfer, %u, ep 0x%llx, done %lu, sg %u/%u.\n", xfer->len,
@@ -3503,12 +3672,14 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			xdma_kthread_wakeup(engine->cmplthp);
 
 		if (timeout_ms > 0)
-			xlx_wait_event_interruptible_timeout(xfer->wq,
-				(xfer->state != TRANSFER_STATE_SUBMITTED),
+			wait_ret = xlx_wait_event_interruptible_timeout(xfer->wq,
+				(xfer->state != TRANSFER_STATE_SUBMITTED
+					&& xfer->state != TRANSFER_STATE_NEW),
 				msecs_to_jiffies(timeout_ms));
 		else
-			xlx_wait_event_interruptible(xfer->wq,
-				(xfer->state != TRANSFER_STATE_SUBMITTED));
+			wait_ret = xlx_wait_event_interruptible(xfer->wq,
+				(xfer->state != TRANSFER_STATE_SUBMITTED
+					&& xfer->state != TRANSFER_STATE_NEW));
 
 		spin_lock_irqsave(&engine->lock, flags);
 
@@ -3520,14 +3691,16 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			dbg_tfr("transfer %p, %u, ep 0x%llx compl, +%lu.\n",
 				xfer, xfer->len, req->ep_addr - xfer->len,
 				done);
+			xdma_trace(engine, "xfer %p completed\n", xfer);
 
 			/* For C2H streaming use writeback results */
 			if (engine->streaming &&
 			    engine->dir == DMA_FROM_DEVICE) {
 				struct xdma_result *result = xfer->res_virt;
 
-				for (i = 0; i < xfer->desc_cmpl; i++)
+				for (i = 0; i < xfer->desc_cmpl; i++) {
 					done += result[i].length;
+                }
 
 				/* finish the whole request */
 				if (engine->eop_flush)
@@ -3540,6 +3713,7 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			pr_info("xfer 0x%p,%u, failed, ep 0x%llx.\n", xfer,
 				xfer->len, req->ep_addr - xfer->len);
 			spin_unlock_irqrestore(&engine->lock, flags);
+			xdma_trace(engine, "xfer %p failed\n", xfer);
 
 #ifdef __LIBXDMA_DEBUG__
 			transfer_dump(xfer);
@@ -3547,20 +3721,62 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 #endif
 			rv = -EIO;
 			break;
+		case TRANSFER_STATE_SUBMITTED:
+			/* transfer can still be in-flight */
+			pr_err("%s, xfer 0x%p,%u timed out, ep 0x%llx.\n",
+				engine->name, xfer, xfer->len, req->ep_addr);
+			xdma_engine_stop(engine);
+			spin_unlock_irqrestore(&engine->lock, flags);
+
+			// wait for xfer aborted in interrupt handler
+			xlx_wait_event_timeout(xfer->wq,
+				(xfer->state != TRANSFER_STATE_SUBMITTED),
+				msecs_to_jiffies(100));
+			if (xfer->state == TRANSFER_STATE_SUBMITTED) {
+				pr_err("cancel transfer failed, force deque\n");
+				spin_lock_irqsave(&engine->lock, flags);
+				engine_status_read(engine, 0, 1);
+				transfer_abort(engine, xfer);\
+				// engine->running = STOPPED;
+				spin_unlock_irqrestore(&engine->lock, flags);
+			}
+			rv = -ERESTARTSYS;
+			break;
+		case TRANSFER_STATE_NEW:
+			/* transfer timeout before submitted */
+			pr_info("%s, xfer 0x%p timeout before submitted; running=%d\n",
+				engine->name, xfer, engine->running);
+			engine_status_read(engine, 0, 1);
+			transfer_abort(engine, xfer);
+			spin_unlock_irqrestore(&engine->lock, flags);
+			rv = -ERESTARTSYS;
+			break;
 		default:
 			/* transfer can still be in-flight */
-			pr_info("xfer 0x%p,%u, s 0x%x timed out, ep 0x%llx.\n",
+			pr_err("%s, xfer 0x%p,%u, s 0x%x timed out, ep 0x%llx.\n",
+				engine->name,
 				xfer, xfer->len, xfer->state, req->ep_addr);
-			engine_status_read(engine, 0, 1);
-				rv = transfer_abort(engine, xfer);
-				if (rv < 0) {
-					pr_err("Failed to stop engine\n");
-				} else if (rv == 0) {
-					rv = xdma_engine_stop(engine);
-					if (rv < 0)
-						pr_err("Failed to stop engine\n");
-			}
+#if 0
+			// remove xfer from transfer_list
+			transfer_abort(engine, xfer);
+			xdma_engine_stop(engine);
 			spin_unlock_irqrestore(&engine->lock, flags);
+#else
+			xdma_engine_stop(engine);
+			spin_unlock_irqrestore(&engine->lock, flags);
+			// wait for xfer aborted by irq
+			xlx_wait_event_interruptible_timeout(xfer->wq,
+				(xfer->state != TRANSFER_STATE_SUBMITTED),
+				msecs_to_jiffies(100));
+			if (xfer->state == TRANSFER_STATE_SUBMITTED) {
+				pr_err("cancel transfer failed, force deque\n");
+				spin_lock_irqsave(&engine->lock, flags);
+				transfer_abort(engine, xfer);
+				spin_unlock_irqrestore(&engine->lock, flags);
+			} else {
+				// pr_info("transfer cancelled properly\n");
+			}
+#endif
 
 #ifdef __LIBXDMA_DEBUG__
 			transfer_dump(xfer);
@@ -4075,11 +4291,12 @@ static struct xdma_dev *alloc_dev_instance(struct pci_dev *pdev)
 		spin_lock_init(&engine->lock);
 		mutex_init(&engine->desc_lock);
 		INIT_LIST_HEAD(&engine->transfer_list);
+		INIT_LIST_HEAD(&engine->transfer_pending_list);
 #if HAS_SWAKE_UP
-		init_swait_queue_head(&engine->shutdown_wq);
+		// init_swait_queue_head(&engine->shutdown_wq);
 		init_swait_queue_head(&engine->xdma_perf_wq);
 #else
-		init_waitqueue_head(&engine->shutdown_wq);
+		// init_waitqueue_head(&engine->shutdown_wq);
 		init_waitqueue_head(&engine->xdma_perf_wq);
 #endif
 	}
@@ -4089,11 +4306,12 @@ static struct xdma_dev *alloc_dev_instance(struct pci_dev *pdev)
 		spin_lock_init(&engine->lock);
 		mutex_init(&engine->desc_lock);
 		INIT_LIST_HEAD(&engine->transfer_list);
+		INIT_LIST_HEAD(&engine->transfer_pending_list);
 #if HAS_SWAKE_UP
-		init_swait_queue_head(&engine->shutdown_wq);
+		// init_swait_queue_head(&engine->shutdown_wq);
 		init_swait_queue_head(&engine->xdma_perf_wq);
 #else
-		init_waitqueue_head(&engine->shutdown_wq);
+		// init_waitqueue_head(&engine->shutdown_wq);
 		init_waitqueue_head(&engine->xdma_perf_wq);
 #endif
 	}
@@ -4219,7 +4437,7 @@ static void remove_engines(struct xdma_dev *xdev)
 			rv = engine_destroy(xdev, engine);
 			if (rv < 0)
 				pr_err("Failed to destroy H2C engine %d\n", i);
-			dbg_sg("%s, %d removed", engine->name, i);
+			// dbg_sg("%s, %d removed", engine->name, i);
 		}
 	}
 
@@ -4230,7 +4448,7 @@ static void remove_engines(struct xdma_dev *xdev)
 			rv = engine_destroy(xdev, engine);
 			if (rv < 0)
 				pr_err("Failed to destroy C2H engine %d\n", i);
-			dbg_sg("%s, %d removed", engine->name, i);
+			//dbg_sg("%s, %d removed", engine->name, i);
 		}
 	}
 }
