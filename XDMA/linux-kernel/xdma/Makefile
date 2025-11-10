@@ -21,11 +21,14 @@ topdir := $(shell cd $(src)/.. && pwd)
 TARGET_MODULE:=xdma
 
 EXTRA_CFLAGS := -I$(topdir)/include $(XVC_FLAGS)
+ccflags-y := -I$(topdir)/include $(XVC_FLAGS)
 ifeq ($(DEBUG),1)
 	EXTRA_CFLAGS += -D__LIBXDMA_DEBUG__
+	ccflags-y += -D__LIBXDMA_DEBUG__
 endif
 ifneq ($(config_bar_num),)
 	EXTRA_CFLAGS += -DXDMA_CONFIG_BAR_NUM=$(config_bar_num)
+	ccflags-y += -DXDMA_CONFIG_BAR_NUM=$(config_bar_num)
 endif
 #EXTRA_CFLAGS += -DINTERNAL_TESTING
 
@@ -41,6 +44,8 @@ all :
 clean:
 	$(MAKE) -C $(BUILDSYSTEM_DIR) M=$(PWD) clean
 	@/bin/rm -f *.ko modules.order *.mod.c *.o *.o.ur-safe .*.o.cmd
+
+MO ?= $(PWD)
 
 install: all
 	@rm -f /lib/modules/5.15.0-67-generic/extra/xdma.ko
